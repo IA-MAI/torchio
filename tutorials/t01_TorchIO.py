@@ -3,8 +3,13 @@
 # - saving images, no display
 # - use local datasets 
 
-
+# understand the loss, use standard loss functions
+# test inference one image
+# use validation and tests 
+# generate images during the training
 # prepare a working segmentation pipeline
+# compare patch vs whole: time, accuracy
+#  - use different iterations, patch size
 # use medSeg models
 # apply on the challenge dataset
 
@@ -33,9 +38,9 @@ device = torch.device('cuda') if torch.cuda.is_available() else 'cpu'
 
 reset_results         = 0
 doComputeHistogram    = 0
-useWholeImages        = 0 
+useWholeImages        = 0
 
-num_epochs            = 2
+num_epochs            = 50
 epoch_save_count      = 1
 
 in_channels           = 1 # number of input channel e.g. for rgb = 3 
@@ -46,7 +51,7 @@ validation_batch_size = 16 #32
 
 threshold             = 0.5
 seed                  = 42  # for reproducibility
-training_split_ratio = 0.9  # use 90% of samples for training, 10% for testing
+training_split_ratio = 0.50  # use 90% of samples for training, 10% for testing
 
 dataset_url              = 'https://www.dropbox.com/s/ogxjwjxdv5mieah/ixi_tiny.zip?dl=0'
 dataset_path             = 'data/ixi_tiny.zip'
@@ -239,6 +244,13 @@ def prepare_batch(batch, device):
     return inputs, targets
 
 def get_dice_score(output, target, epsilon=1e-9):
+    # print(type(target), type(output))
+    # print(torch.unique(target))
+    # print(torch.unique(output))
+    # print(type(target), type(output))
+    # print(torch.unique(target))
+    # print(torch.unique(output))
+
     p0 = output
     g0 = target
     p1 = 1 - p0
@@ -248,11 +260,22 @@ def get_dice_score(output, target, epsilon=1e-9):
     fn = (p1 * g0).sum(dim=SPATIAL_DIMENSIONS)
     num = 2 * tp
     denom = 2 * tp + fp + fn + epsilon
-    dice_score = num / denom
-    return dice_score
+    dice_grad = num / denom
+
+    output = (output > 0.5).float()
+    target = target.float()
+    intersection = (output * target).sum()
+    union = output.sum() + target.sum()
+    dice_score = (2. * intersection + epsilon) / (union + epsilon)
+
+    # print("dice_score: ",dice_score)
+
+    return dice_grad, dice_score
 
 def get_dice_loss(output, target):
-    return 1 - get_dice_score(output, target)
+    dice_grad, dice_score = get_dice_score(output, target)
+    loss =  1 - dice_grad
+    return loss, dice_score 
 
 def get_model_and_optimizer(device):
     model = UNet(
@@ -280,7 +303,7 @@ def run_epoch(epoch_idx, action, loader, model, optimizer):
         with torch.set_grad_enabled(is_training):
             logits = model(inputs)
             probabilities = F.softmax(logits, dim=CHANNELS_DIMENSION)
-            batch_losses = get_dice_loss(probabilities, targets)
+            batch_losses, dice_score = get_dice_loss(probabilities, targets)
             batch_loss = batch_losses.mean()
             if is_training:
                 batch_loss.backward()
@@ -288,19 +311,40 @@ def run_epoch(epoch_idx, action, loader, model, optimizer):
             times.append(time.time())
             epoch_losses.append(batch_loss.item())
     epoch_losses = np.array(epoch_losses)
-    print(f'{action.value} mean loss: {epoch_losses.mean():0.3f}')
-    return times, epoch_losses
+    print(f'{action.value} mean loss: {epoch_losses.mean():0.3f} dice socre: {dice_score:0.3f}')
+    return times, epoch_losses, dice_score
 
 def train(num_epochs, training_loader, validation_loader, model, optimizer, weights_stem):
     train_losses = []
     val_losses = []
-    val_losses.append(run_epoch(0, Action.VALIDATE, validation_loader, model, optimizer))
+    times, epoch_losses, dice_score = run_epoch(0, Action.VALIDATE, validation_loader, model, optimizer)
+    dice_score     = round(dice_score.item(), 2)
+    sTm = time.time()
+    val_losses.append([times, epoch_losses])
     for epoch_idx in range(1, num_epochs + 1):
         print('Starting epoch', epoch_idx)
-        train_losses.append(run_epoch(epoch_idx, Action.TRAIN, training_loader, model, optimizer))
-        val_losses.append(run_epoch(epoch_idx, Action.VALIDATE, validation_loader, model, optimizer))
+        trn_times, trn_epoch_losses, trn_dice_score = run_epoch(epoch_idx, Action.TRAIN, training_loader, model, optimizer)
+        train_losses.append([trn_times, trn_epoch_losses])
+        val_times, val_epoch_losses, val_dice_score = run_epoch(epoch_idx, Action.VALIDATE, validation_loader, model, optimizer)
+        val_losses.append([val_times, val_epoch_losses])
         #modelName = "whileImage" if useWhole else "patchImage"
-        torch.save(model.state_dict(), f'results/res_{weights_stem}_epoch_{epoch_idx}.pth')
+        val_dice_score = round(val_dice_score.item(), 2)
+        if val_dice_score> dice_score:
+           torch.save(model.state_dict(), f'results/res_{weights_stem}_epoch_{epoch_idx}.pth')
+           dice_score = val_dice_score
+
+        fig, ax = plt.subplots()
+        plot_times(ax, np.array(train_losses), 'Training')
+        plot_times(ax, np.array(val_losses)  , 'Validation')
+        ax.grid()
+        ax.set_xlabel('Time')
+        ax.set_ylabel('Dice loss')
+        ax.set_title('Training with '+weights_stem)
+        ax.legend()
+        fig.autofmt_xdate()
+        fig.savefig('results/res_losses_'+weights_stem+'.png')
+
+    print("training time: ", (time.time()-sTm)/60, " Minutes") 
     return np.array(train_losses), np.array(val_losses)
 
 
