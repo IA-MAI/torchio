@@ -1,17 +1,24 @@
 # -*- coding: utf-8 -*-
-# Modified from google colab
-# - saving images, no display
-# - use local datasets 
+#   Binary 3D segmentation example modified from google colab
+#      https://colab.research.google.com/github/fepegar/torchio-notebooks/blob/main/notebooks/TorchIO_tutorial.ipynb
+#   requires: 
+#     pip3 install unet 
+#     pip3 install torchio
+#   
 
-# understand the loss, use standard loss functions
-# test inference one image
-# use validation and tests 
-# generate images during the training
-# prepare a working segmentation pipeline
-# compare patch vs whole: time, accuracy
-#  - use different iterations, patch size
-# use medSeg models
-# apply on the challenge dataset
+# [X] Understanding the loss function 
+#     - Use standard loss function 
+#     - use the dice: not good for learning
+# [ ] Add a single image inference     
+#     - input 3D image, output a segmentation + dice score if groundtruth is available
+# [ ] Monitor training:
+#     - generate images during the training
+# [ ] Compare patch vs whole e.g. time, accuracy
+#     - use different iterations, patch size
+# [ ] Add support for different models e.g. medSeg models
+# [ ] Add support for different datasets
+# [ ] Add support for instance multi-class segmentation
+#     - test on binary vertebrae datasets
 
 """Import modules:"""
 # Commented out IPython magic to ensure Python compatibility.
@@ -30,28 +37,26 @@ import torch.nn as nn
 from unet import UNet
 import numpy as np
 
-
-
 # Config
 # ============== Config ===================
 device = torch.device('cuda') if torch.cuda.is_available() else 'cpu'
 
-reset_results         = 0
-doComputeHistogram    = 0
-useWholeImages        = 0
+reset_results            = 0
+doComputeHistogram       = 0
+useWholeImages           = 1
 
-num_epochs            = 50
-epoch_save_count      = 1
+num_epochs               = 50
+epoch_save_count         = 1
 
-in_channels           = 1 # number of input channel e.g. for rgb = 3 
-out_channels          = 2 # number of classes 
-patch_size            = 0 #24
-training_batch_size   = 16 #16
-validation_batch_size = 16 #32
+in_channels              = 1  # number of input channel e.g. for rgb = 3 
+out_channels             = 2  # number of classes 
+patch_size               = 0  # 24
+training_batch_size      = 16 # 16
+validation_batch_size    = 16 # 32
 
-threshold             = 0.5
-seed                  = 42  # for reproducibility
-training_split_ratio = 0.50  # use 90% of samples for training, 10% for testing
+threshold                = 0.5
+seed                     = 42   # for reproducibility
+training_split_ratio     = 0.50  # use 90% of samples for training, 10% for testing
 
 dataset_url              = 'https://www.dropbox.com/s/ogxjwjxdv5mieah/ixi_tiny.zip?dl=0'
 dataset_path             = 'data/ixi_tiny.zip'
@@ -60,12 +65,10 @@ dataset_dir              = Path(dataset_dir_name)
 
 histogram_landmarks_path = 'data/landmarks.npy'
 
-
 # If the following values are False, the models will be downloaded and not computed
-compute_histograms = False
-train_whole_images = True # False = no trianing, use pretrainedmodel 
-train_patches      = True # False = no trianing, use pretrainedmodel 
-
+compute_histograms       = False
+train_whole_images       = True # False = no trianing, use pretrainedmodel 
+train_patches            = True # False = no trianing, use pretrainedmodel 
 
 def plot_histogram(axis, tensor, num_positions=100, label=None, alpha=0.05, color=None):
     values = tensor.numpy().ravel()
@@ -100,7 +103,6 @@ label_paths = sorted(labels_dir.glob('*.nii.gz'))
 
 assert len(image_paths) == len(label_paths)
 
-
 subjects = []
 for (image_path, label_path) in zip(image_paths, label_paths):
     subject = tio.Subject(
@@ -123,7 +125,6 @@ print(one_subject.brain)
 
 paths = image_paths
 
-
 if compute_histograms:    
     fig, ax = plt.subplots(dpi=100)
     sTm = time.time()
@@ -141,6 +142,7 @@ if compute_histograms:
     ax.grid()
     fig.savefig("data/hist_original.png")
     print("time: ", time.time()-sTm)
+
 landmarks = tio.HistogramStandardization.train(
     image_paths,
     output_path=histogram_landmarks_path,
@@ -183,11 +185,7 @@ ax.set_xlabel('Intensity')
 #ax.grid()
 fig.savefig("data/hist_znormed.png")
 
-
-
-
 """## Training a network
-
 
 """
 
@@ -227,7 +225,7 @@ training_subjects, validation_subjects = torch.utils.data.random_split(subjects,
 training_set   = tio.SubjectsDataset(training_subjects, transform=training_transform)
 validation_set = tio.SubjectsDataset(validation_subjects, transform=validation_transform)
 
-print('Training set  : ', len(training_set), 'subjects')
+print('Training set  : ', len(training_set),   'subjects')
 print('Validation set: ', len(validation_set), 'subjects')
 
 """### Deep learning stuff"""
@@ -243,7 +241,11 @@ def prepare_batch(batch, device):
     targets = batch['brain'][tio.DATA].to(device)
     return inputs, targets
 
-def get_dice_score(output, target, epsilon=1e-9):
+
+
+def get_soft_dice_score(output, target, epsilon=1e-9):
+    # Computing soft Dice loss or differentiable Dice score.
+    # the value is more "forgiving" during training, allowing the model to improve gradually
     # print(type(target), type(output))
     # print(torch.unique(target))
     # print(torch.unique(output))
@@ -260,22 +262,42 @@ def get_dice_score(output, target, epsilon=1e-9):
     fn = (p1 * g0).sum(dim=SPATIAL_DIMENSIONS)
     num = 2 * tp
     denom = 2 * tp + fp + fn + epsilon
-    dice_grad = num / denom
+    return (num / denom).mean()
 
+def get_dice_score(output, target, epsilon=1e-9):
     output = (output > 0.5).float()
     target = target.float()
     intersection = (output * target).sum()
     union = output.sum() + target.sum()
-    dice_score = (2. * intersection + epsilon) / (union + epsilon)
-
-    # print("dice_score: ",dice_score)
-
-    return dice_grad, dice_score
+    dice_score =  (2. * intersection + epsilon) / (union + epsilon)   
+    return torch.tensor(dice_score, requires_grad=True)
 
 def get_dice_loss(output, target):
-    dice_grad, dice_score = get_dice_score(output, target)
-    loss =  1 - dice_grad
-    return loss, dice_score 
+    dice_score = get_dice_score(output, target)
+    dice_loss  =  1 - get_soft_dice_score(output, target)    
+    # this works but the model is not learing 
+    #dice_loss  =  1 - dice_score
+    return dice_loss, dice_score 
+
+def get_cross_entropy_loss(output, target, epsilon=1e-9):
+    # Compute dice score for monitoring (using your existing function)
+    dice_score = get_dice_score(output, target)
+  
+    # Ensure output is probabilities
+    if output.dim() == target.dim():
+        output = output.unsqueeze(1)
+
+    # Check if output is already in the correct format
+    if output.shape[1] == 1:
+        # If output is a single channel, assume it's the probability of the positive class
+        output = torch.cat([1 - output, output], dim=1)
+    
+    # Convert probabilities to logits
+    output = torch.log(output / (1 - output + epsilon) + epsilon)
+    
+    # Compute binary cross-entropy loss
+    bce_loss = F.binary_cross_entropy_with_logits(output[:, 1], target.float())  
+    return bce_loss, dice_score
 
 def get_model_and_optimizer(device):
     model = UNet(
@@ -303,8 +325,11 @@ def run_epoch(epoch_idx, action, loader, model, optimizer):
         with torch.set_grad_enabled(is_training):
             logits = model(inputs)
             probabilities = F.softmax(logits, dim=CHANNELS_DIMENSION)
-            batch_losses, dice_score = get_dice_loss(probabilities, targets)
-            batch_loss = batch_losses.mean()
+            #batch_loss, dice_score = get_dice_loss(probabilities, targets)
+            batch_loss, dice_score = get_cross_entropy_loss(probabilities, targets)
+            #batch_loss = (1-dice_score).requires_grad_(True)
+            # print("batch_loss:   ",batch_loss)
+            # print("1-dice_score: ",1-dice_score)        
             if is_training:
                 batch_loss.backward()
                 optimizer.step()
@@ -346,7 +371,6 @@ def train(num_epochs, training_loader, validation_loader, model, optimizer, weig
 
     print("training time: ", (time.time()-sTm)/60, " Minutes") 
     return np.array(train_losses), np.array(val_losses)
-
 
 def trainWholeImage():
     training_instance = training_set[42]  # transform is applied inside SubjectsDataset
@@ -564,7 +588,7 @@ def main(useWholeImages=useWholeImages):
        trainWholeImage()
     else:
        trainPatchImage()
+
 if __name__ == '__main__':
-    print("useWholeImages: ",useWholeImages)
-    main(useWholeImages=useWholeImages)
-    
+    print("useWholeImages: ", useWholeImages)
+    main(useWholeImages=useWholeImages)    
