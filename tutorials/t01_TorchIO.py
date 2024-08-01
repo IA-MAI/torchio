@@ -11,7 +11,9 @@
 #     - use the dice: not good for learning
 # [x] Add a single image inference     
 #     - input 3D image, output a segmentation + dice score if groundtruth is available
-# [ ] Monitor training:
+# [ ]Fix bad performance 
+#     - monitor test during training
+#     - over fitting? 
 #     - generate images during the training
 # [ ] Compare patch vs whole e.g. time, accuracy
 #     - use different iterations, patch size
@@ -19,16 +21,23 @@
 # [ ] Add support for different datasets
 # [ ] Add support for instance multi-class segmentation
 #     - test on binary vertebrae datasets
+# [ ] - separate files:
+#       - training_whole
+#       - training_patch
+#       - inference
+#       - dataset
+#       - common: e.g. plotting    
+#       - models
+#       - losses  
+# [ ] cleaning
 
 """Import modules:"""
-# Commented out IPython magic to ensure Python compatibility.
 import os, sys, enum, time, random, multiprocessing, json, shutil
 from pathlib import Path
 from scipy import stats
 from scipy.ndimage import zoom
 
 import matplotlib.pyplot as plt
-#from IPython import display
 from tqdm.auto import tqdm
 
 import torch
@@ -42,7 +51,7 @@ import numpy as np
 # ============== Config ===================
 device = torch.device('cuda') if torch.cuda.is_available() else 'cpu'
 
-doTraining               = 0 # training vs inference
+doTraining               = 1 # training vs inference
 isDoTestSpliting         = 0 # reset the training, validation and testing datasets
 
 lossfunctionID           = 0
@@ -53,17 +62,17 @@ useWholeImages           = 1
 num_epochs               = 10
 epoch_save_count         = 1
 
-new_3D_size = (48, 60, 48) # images will be resized to this size
+new_3D_size = (48, 60, 48) # (48, 60, 48) images will be resized to this size
 
 in_channels              = 1  # number of input channel e.g. for rgb = 3 
 out_channels             = 2  # number of classes 
 patch_size               = 0  # 24
-training_batch_size      = 16 # 16
-validation_batch_size    = 16 # 32
-
+training_batch_size      = 32 # 16
+validation_batch_size    = 2 * training_batch_size # 2 * training_batch_size
+testing_batch_size       = 2 * training_batch_size # 2 * training_batch_size
 threshold                = 0.5
 seed                     = 42   # for reproducibility
-training_split_ratios    = [0.50, 0.40, 0.10]  # training, validation, testing 
+training_split_ratios    = [0.70, 0.15, 0.15]  # training, validation, testing 
 
 
 dataset_url              = 'https://www.dropbox.com/s/ogxjwjxdv5mieah/ixi_tiny.zip?dl=0'
@@ -82,11 +91,11 @@ if not doTraining:
     print(inputImagePath)
     print(inputLabelPath)
     epochModelWholePath  = "results/model_whole_images_epoch_7.pth"  
-    finalModelWholePath  = "results/model_whole_images_state_dict.pth"  # 50 epochs, 0.990 dice  
+    bestModelWholePath  = "results/model_whole_images_best.pth"  # 50 epochs, 0.990 dice  
     epochModelPatchPath  = "results/model_patch_images_epoch_7.pth"  
-    finalModelPatchPath  = "results/model_patch_images_state_dict.pth"  # 50 epochs, 0.990 dice  
+    bestModelPatchPath  = "results/model_patch_images_best.pth"  # 50 epochs, 0.990 dice  
 
-    inputModelPath       = finalModelWholePath
+    inputModelPath       = bestModelWholePath
 
     outputSegPath   = "results/result-label.nii.gz" 
 
@@ -106,7 +115,6 @@ upsampling_type = "linear"
 padding = True
 activation = "PReLU"
 resample_to = 4
-crop_or_pad_size = [48, 60, 48]                
 #histogram_landmarks_lst = histogram_landmarks.tolist() 
 
 def doTestSpliting():
@@ -177,6 +185,13 @@ def plot_losses(xData, yData, xTitle, yTitle, xLabel,yLabel, fTitle,figOutputPat
     ax.legend()
     fig.autofmt_xdate()
     fig.savefig(figOutputPath)
+
+def plot_testing_result(subject, output_path):
+    subject.plot(figsize=(9, 8), cmap_dict={'predicted': 'RdBu_r'},show=False,output_path=output_path)
+    for key in subject.keys():
+        if isinstance(subject[key], tio.Image):
+            print(f"{key} dtype:", subject[key].data.dtype)
+            print(f"{key} range:", subject[key].data.min(), subject[key].data.max())
 
 random.seed(seed)
 torch.manual_seed(seed)
@@ -344,7 +359,7 @@ config = {
         "padding": padding,
         "activation": activation,
         "resample_to": resample_to,
-        "crop_or_pad_size": crop_or_pad_size,               
+        "new_3D_size": new_3D_size,               
         "histogram_landmarks_lst": histogram_landmarks.tolist()  # Convert numpy array to list
 }
 if compute_histograms:
@@ -442,19 +457,27 @@ def get_cross_entropy_loss(output, target, epsilon=1e-9):
     bce_loss = F.binary_cross_entropy_with_logits(output[:, 1], target.float())  
     return bce_loss, dice_score
 
-def get_model_and_optimizer(device):
+
+def getModel(config):
+    # Load model
     model = UNet(
-        in_channels=1,
-        out_classes=2,
-        dimensions=3,
-        num_encoding_blocks=3,
-        out_channels_first_layer=8,
-        normalization='batch',
-        upsampling_type='linear',
-        padding=True,
-        activation='PReLU',
-    ).to(device)
+        in_channels=config['in_channels'],
+        out_classes=config['out_classes'],
+        dimensions=config['dimensions'],
+        num_encoding_blocks=config['num_encoding_blocks'],
+        out_channels_first_layer=config['out_channels_first_layer'],
+        normalization=config['normalization'],
+        upsampling_type=config['upsampling_type'],
+        padding=config['padding'],
+        activation=config['activation'],
+    )
+    return model
+
+def get_model_and_optimizer(config,device):
+      
+    model = getModel(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters())
+
     return model, optimizer
 
 def run_epoch(epoch_idx, action, loader, model, optimizer):
@@ -483,18 +506,17 @@ def run_epoch(epoch_idx, action, loader, model, optimizer):
             times.append(time.time())
             epoch_losses.append(batch_loss.item())
     epoch_losses = np.array(epoch_losses)
-    print(f'{action.value} mean loss: {epoch_losses.mean():0.3f} dice socre: {dice_score:0.3f}')
     return times, epoch_losses, dice_score
 
-def train(num_epochs, training_loader, validation_loader, model, optimizer,  weights_stem):
+def train(num_epochs, training_loader, validation_loader, testing_loader, model, optimizer,  weights_stem):
     train_losses = []
     val_losses = []
     times, epoch_losses, dice_score = run_epoch(0, Action.VALIDATE, validation_loader, model, optimizer)
-    dice_score     = round(dice_score.item(), 2)
+    val_dice_best     = round(dice_score.item(), 2)
     sTm = time.time()
     val_losses.append([times, epoch_losses])
     for epoch_idx in range(1, num_epochs + 1):
-        print('Starting epoch', epoch_idx)
+        #print('Starting epoch', epoch_idx)
         trn_times, trn_epoch_losses, trn_dice_score = run_epoch(epoch_idx, Action.TRAIN, training_loader, model, optimizer)
         train_losses.append([trn_times, trn_epoch_losses])
         val_times, val_epoch_losses, val_dice_score = run_epoch(epoch_idx, Action.VALIDATE, validation_loader, model, optimizer)
@@ -502,30 +524,53 @@ def train(num_epochs, training_loader, validation_loader, model, optimizer,  wei
         #modelName = "whileImage" if useWhole else "patchImage"
         val_dice_score = round(val_dice_score.item(), 2)
         modelPath = f'results/model_{weights_stem}_epoch_{epoch_idx}.pth'
-        if val_dice_score> dice_score:
+        if val_dice_score> val_dice_best:
             torch.save(model.state_dict(), modelPath)
-            dice_score = val_dice_score
+            val_dice_best = val_dice_score
             with open(modelPath[:-4]+'.json', 'w') as f:
                 json.dump(config, f)
+            modelFinalPath=f'results/model_{weights_stem}_best.pth'
+            shutil.copy(modelPath,modelFinalPath)
+            shutil.copy(modelPath[:-4]+'.json',modelFinalPath[:-4]+'.json')
+
+            # test model:
+            tst_dice_scores = []
+            # model.eval()
+            # with torch.no_grad():
+            #     # Apply the model
+            #     for batch_idx, batch in enumerate(tqdm(testing_loader)):
+            #         inputs, targets = prepare_batch(batch, device)
+            #         output = model(inputs)
+            #         output = torch.nn.functional.softmax(output, dim=1)
+            #         output = (output > 0.5).float()
+
+            #         #output = output.argmax(dim=1).squeeze().cpu().numpy()            
+            #         # print("output  : ",output.shape)
+            #         # print("targets : ",targets.shape)
+            #         # print("targets min max: ",torch.min(targets), torch.max(targets))
+            #         # print("output min max: ",torch.min(output), torch.max(output))
+            #         # print("targets unique: ",torch.unique(targets))
+            #         #print("output unique: ",torch.unique(output))
+            #         dice = get_dice_score(targets,output)
+            #         #print("dice   : ",dice)
+            #         # print(ok)
+            #         tst_dice_scores.append(dice.item())
+            # tst_dice_score = np.array(tst_dice_scores).mean()
+            for batch_idx, batch in enumerate(tqdm(testing_subjects_paths)):
+                 dice = doInference(batch[0], modelFinalPath, batch[1], outputPath=None,doSave=0)
+                 tst_dice_scores.append(dice)
+            tst_dice_score = np.array(tst_dice_scores).mean()
+            # print(f' val_dice: {dice_score:0.3f} tst_dice: {tst_dice_score:0.3f}')
+        print(f'epoch {epoch_idx}/{num_epochs}: loss: {trn_epoch_losses.mean():0.3f} val_dice: {val_dice_best:0.3f} tst_dice: {tst_dice_score:0.3f}')
 
         plot_losses(train_losses, val_losses, 'Training', 'Validation', 'Time','Loss', 'Training with '+weights_stem,
                     'results/res_losses_'+weights_stem+'.png')
-
-        # fig, ax = plt.subplots()
-        # plot_times(ax, np.array(train_losses), 'Training')
-        # plot_times(ax, np.array(val_losses)  , 'Validation')
-        # ax.grid()
-        # ax.set_xlabel('Time')
-        # ax.set_ylabel('Loss')
-        # ax.set_title('Training with '+weights_stem)
-        # ax.legend()
-        # fig.autofmt_xdate()
-        # fig.savefig('results/res_losses_'+weights_stem+'.png')
-
+    
     print("training time: ", (time.time()-sTm)/60, " Minutes") 
     return np.array(train_losses), np.array(val_losses)
 
 def trainWholeImage():
+    print( "================== Whole images ========================")
     training_instance = training_dataset[42]  # transform is applied inside SubjectsDataset
     output_path = "results/res_training_instance.png"
     training_instance.plot(show=False,output_path=output_path)
@@ -534,10 +579,10 @@ def trainWholeImage():
     output_path = "results/res_validation_instance.png"
     validation_instance.plot(show=False,output_path=output_path)
 
-    print( "### Whole images ========================")
-
-    training_batch_size = 16
-    validation_batch_size = 2 * training_batch_size
+    model, optimizer = get_model_and_optimizer(config,device)
+    weights_stem = 'whole_images'
+    modelPath    = "results/model_"+weights_stem+ "_state_dict.pth"
+    k = 24 # ?
 
     training_loader = torch.utils.data.DataLoader(
         training_dataset,
@@ -552,40 +597,30 @@ def trainWholeImage():
         num_workers=num_workers,
     )
 
+    testing_loader = torch.utils.data.DataLoader(
+        testing_dataset,
+        batch_size=testing_batch_size,
+        num_workers=num_workers,
+    )
+
     print("Visualize axial slices of one batch........")
-
     one_batch = next(iter(training_loader))
-
-    k = 24
-    batch_mri  = one_batch['mri'][tio.DATA][..., k]
+    
+    batch_mri   = one_batch['mri'][tio.DATA][..., k]
     batch_label = one_batch['brain'][tio.DATA][:, 1:, ..., k]
     slices = torch.cat((batch_mri, batch_label))
     image_path = 'results/res_batch_whole_images.png'
     torchvision.utils.save_image(
-        slices,
-        image_path,
-        nrow=training_batch_size//2,
-        normalize=True,
-        scale_each=True,
-        padding=0,
+        slices,  image_path, nrow=training_batch_size//2,
+        normalize=True, scale_each=True, padding=0,
     )
-    #display.Image(image_path)
 
-    print("#### train_whole_images  ==================")
-    model, optimizer = get_model_and_optimizer(device)
-    weights_stem = 'whole_images'
-    modelPath = "results/model_"+weights_stem+ "_state_dict.pth"
     if train_whole_images:
-        train_losses, val_losses = train(num_epochs, training_loader, validation_loader, model, optimizer, weights_stem)
-        checkpoint = {
-            'train_losses': train_losses,
-            'val_losses': val_losses,
-            'weights': model.state_dict(),
-        }
+        train_losses, val_losses = train(num_epochs, training_loader, validation_loader,testing_loader,  model, optimizer, weights_stem)
+        checkpoint = {'train_losses': train_losses,  'val_losses': val_losses,  'weights': model.state_dict() }
         torch.save(checkpoint, modelPath)
         with open(modelPath[:-4]+'.json', 'w') as f:
              json.dump(config, f)
-
     else:
         checkpoint = torch.load(modelPath, map_location=device)
         model.load_state_dict(checkpoint['weights'])
@@ -595,7 +630,6 @@ def trainWholeImage():
                     'results/res_losses_'+weights_stem+'.png')
 
     print(" #### Test ========================")
-    testing_batch_size = 2
     testing_loader = torch.utils.data.DataLoader(
         testing_dataset,
         batch_size=testing_batch_size,
@@ -610,21 +644,19 @@ def trainWholeImage():
         probabilities = model(inputs).softmax(dim=1)[:, FOREGROUND:].cpu()
     affine = batch['mri'][tio.AFFINE][0].numpy()
     subject = tio.Subject(
-        mri=tio.ScalarImage(tensor=batch['mri'][tio.DATA][FIRST], affine=affine),
-        label=tio.LabelMap(tensor=batch['brain'][tio.DATA][FIRST], affine=affine),
-        predicted=tio.ScalarImage(tensor=probabilities[FIRST], affine=affine),
+        mri       =  tio.ScalarImage(tensor=batch['mri'][tio.DATA][FIRST], affine=affine),
+        label     =  tio.LabelMap(tensor=batch['brain'][tio.DATA][FIRST], affine=affine),
+        predicted = tio.ScalarImage(tensor=probabilities[FIRST], affine=affine),
     )
-    output_path = "results/res_subject_whole_images.png"
-    subject.plot(figsize=(9, 8), cmap_dict={'predicted': 'RdBu_r'},show=False,output_path=output_path)
-    for key in subject.keys():
-       if isinstance(subject[key], tio.Image):
-          print(f"{key} dtype:", subject[key].data.dtype)
-          print(f"{key} range:", subject[key].data.min(), subject[key].data.max())
+    # output_path = "results/res_subject_whole_images.png"
+    # subject.plot(figsize=(9, 8), cmap_dict={'predicted': 'RdBu_r'},show=False,output_path=output_path)
+    # for key in subject.keys():
+    #    if isinstance(subject[key], tio.Image):
+    #       print(f"{key} dtype:", subject[key].data.dtype)
+    #       print(f"{key} range:", subject[key].data.min(), subject[key].data.max())
+    plot_testing_result(subject, "results/res_subject_whole_images.png")
 
 def trainPatchImage():
-
-    training_batch_size   = 32
-    validation_batch_size = 2 * training_batch_size
 
     patch_size            = 24
     samples_per_volume    = 5
@@ -651,8 +683,19 @@ def trainPatchImage():
         shuffle_patches=False,
     )
 
+    patches_testing_set = tio.Queue(
+        subjects_dataset=testing_dataset,
+        max_length=max_queue_length,
+        samples_per_volume=samples_per_volume,
+        sampler=sampler,
+        num_workers=num_workers,
+        shuffle_subjects=False,
+        shuffle_patches=False,
+    )
+
     training_loader_patches   = torch.utils.data.DataLoader(patches_training_set, batch_size=training_batch_size)
     validation_loader_patches = torch.utils.data.DataLoader(patches_validation_set, batch_size=validation_batch_size)
+    testing_loader_patches    = torch.utils.data.DataLoader(patches_testing_set, batch_size=testing_batch_size)
 
     one_batch = next(iter(training_loader_patches))
     k = int(patch_size // 4)
@@ -669,26 +712,15 @@ def trainPatchImage():
     )
     #display.Image(image_path)
 
-    model, optimizer = get_model_and_optimizer(device)
+    model, optimizer = get_model_and_optimizer(config, device)
     weights_stem = 'patches'
     modelPath    = "results/model_"+weights_stem+ "_state_dict.pth"
     
     if train_patches:
-        train_losses, val_losses = train(
-            num_epochs,
-            training_loader_patches,
-            validation_loader_patches,
-            model,
-            optimizer,
-            weights_stem,
-        )
-        checkpoint = {
-            'train_losses': train_losses,
-            'val_losses': val_losses,
-            'weights': model.state_dict(),
-        }
+        train_losses, val_losses = train(num_epochs, training_loader_patches, validation_loader_patches,testing_loader_patches,
+                                            model, optimizer, weights_stem, )
+        checkpoint = {'train_losses': train_losses,'val_losses': val_losses, 'weights': model.state_dict(), }
         torch.save(checkpoint, modelPath)
-
     else:
         checkpoint = torch.load(modelPath, map_location=device)
         model.load_state_dict(checkpoint['weights'])        
@@ -697,16 +729,16 @@ def trainPatchImage():
     plot_losses(train_losses, val_losses, 'Training', 'Validation', 'Time','Loss', 'Training with '+weights_stem,
                     'results/res_losses_'+weights_stem+'.png')
 
-    subject = random.choice(validation_dataset)
-    input_tensor = sample.mri.data[0]
-    patch_size = 48, 48, 48  # we can user larger patches for inference
+    print(" #### Test ========================")
+    subject = random.choice(testing_dataset)
+    patch_size    = 48, 48, 48  # we can user larger patches for inference
     patch_overlap = 4, 4, 4
-    grid_sampler = tio.inference.GridSampler(
+    grid_sampler  = tio.inference.GridSampler(
         subject,
         patch_size,
         patch_overlap,
     )
-    patch_loader = torch.utils.data.DataLoader(grid_sampler, batch_size=validation_batch_size)
+    patch_loader = torch.utils.data.DataLoader(grid_sampler, batch_size=testing_batch_size)
     aggregator = tio.inference.GridAggregator(grid_sampler)
 
     model.eval()
@@ -719,20 +751,16 @@ def trainPatchImage():
 
     foreground = aggregator.get_output_tensor()
     affine = subject.mri.affine
-    prediction = tio.ScalarImage(tensor=foreground, affine=affine)
-    subject.add_image(prediction, 'prediction')
-    output_path = "results/res_subject_patch.png"
-    subject.plot(figsize=(9, 8), cmap_dict={'prediction': 'RdBu_r'},show=False,output_path=output_path)
-    for key in subject.keys():
-       if isinstance(subject[key], tio.Image):
-          print(f"{key} dtype:", subject[key].data.dtype)
-          print(f"{key} range:", subject[key].data.min(), subject[key].data.max())
+    predicted = tio.ScalarImage(tensor=foreground, affine=affine)
+    subject.add_image(predicted, 'predicted')
+    plot_testing_result(subject, "results/res_subject_patch.png")
 
 
-def doInference(imagePath, modelPath, labelPath=None, outputPath=None, device='cpu'):
-    print(" ===========================")
-    print("          Inference     "    )
-    print(" ===========================")
+def doInference(imagePath, modelPath, labelPath=None, outputPath=None,doSave=1, device='cpu'):
+    if  doSave:
+        print(" ===========================")
+        print("          Inference     "    )
+        print(" ===========================")
     
     # Load configuration
     configPath = os.path.splitext(modelPath)[0] + ".json"
@@ -748,25 +776,14 @@ def doInference(imagePath, modelPath, labelPath=None, outputPath=None, device='c
     transform = tio.Compose([
         tio.ToCanonical(),
         tio.Resample(config['resample_to']),
-        tio.CropOrPad(config['crop_or_pad_size']),
+        tio.CropOrPad(config['new_3D_size']),
         tio.HistogramStandardization({'mri': histogram_landmarks}),
         tio.ZNormalization(masking_method=tio.ZNormalization.mean),
     ])
     transformed = transform(subject)
     
     # Load model
-    model = UNet(
-        in_channels=config['in_channels'],
-        out_classes=config['out_classes'],
-        dimensions=config['dimensions'],
-        num_encoding_blocks=config['num_encoding_blocks'],
-        out_channels_first_layer=config['out_channels_first_layer'],
-        normalization=config['normalization'],
-        upsampling_type=config['upsampling_type'],
-        padding=config['padding'],
-        activation=config['activation'],
-    ).to(device)
-    
+    model = getModel(config).to(device)   
     checkpoint = torch.load(modelPath, map_location=device)
     if len(checkpoint) == 3:
         model.load_state_dict(checkpoint['weights'])
@@ -799,7 +816,8 @@ def doInference(imagePath, modelPath, labelPath=None, outputPath=None, device='c
     if not outputPath:
         outputPath = os.path.splitext(imagePath)[0] + '-label' + os.path.splitext(imagePath)[1]
         
-    tio.LabelMap(tensor=resized_seg.to(torch.uint8), affine=original_image.affine).save(outputPath)
+    if doSave:    
+       tio.LabelMap(tensor=resized_seg.to(torch.uint8), affine=original_image.affine).save(outputPath)
     
     dice_score = None
     if labelPath:
@@ -807,8 +825,7 @@ def doInference(imagePath, modelPath, labelPath=None, outputPath=None, device='c
         true_label_data = true_label.data.squeeze().numpy()
         resized_seg_data = resized_seg.squeeze().numpy()        
         dice_score = get_dice_score(true_label_data,resized_seg_data)
-        
-                
+                        
     return dice_score
 
 
